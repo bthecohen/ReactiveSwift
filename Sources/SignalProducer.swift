@@ -2,7 +2,7 @@ import Dispatch
 import Foundation
 import Result
 
-/// A SignalProducer creates Signals that can produce values of type `Value` 
+/// A SignalProducer creates Signals that can produce values of type `Value`
 /// and/or fail with errors of type `Error`. If no failure should be possible, 
 /// `NoError` can be specified for `Error`.
 ///
@@ -19,7 +19,23 @@ import Result
 public struct SignalProducer<Value, Error: Swift.Error> {
 	public typealias ProducedSignal = Signal<Value, Error>
 
-	private let startHandler: (Signal<Value, Error>.Observer, CompositeDisposable) -> Void
+	/// Wraps a closure which, when invoked, produces a new instance of `Signal`, a
+	/// customized "didCreate" side effect for the `Signal` and a disposable to interrupt
+	/// the produced `Signal`.
+	///
+	/// Unlike the safe `startWithSignal(_:)` API, `Builder` puts the responsibility of
+	/// invoking the side effect on the caller, while it takes over the responsibility of
+	/// the actual formation of the `Signal`.
+	///
+	/// The design allows producer lifting to be as efficient as native `Signal`
+	/// operators, by eliminating the unnecessary relay `Signal` imposed by the old
+	/// `startWithSignal(_:)`, regardless of the fact that lifted operators can rely on
+	/// the upstreams for producer interruption.
+	fileprivate struct Builder {
+		fileprivate let make: () -> (Signal<Value, Error>, () -> Void, Disposable)
+	}
+
+	fileprivate let builder: Builder
 
 	/// Initializes a `SignalProducer` that will emit the same events as the
 	/// given signal.
@@ -49,7 +65,23 @@ public struct SignalProducer<Value, Error: Swift.Error> {
 	/// - parameters:
 	///   - startHandler: A closure that accepts observer and a disposable.
 	public init(_ startHandler: @escaping (Signal<Value, Error>.Observer, CompositeDisposable) -> Void) {
-		self.startHandler = startHandler
+		self.init(Builder {
+			let disposable = CompositeDisposable()
+			let (signal, observer) = Signal<Value, Error>.pipe(disposable: disposable)
+			let start = { startHandler(observer, disposable) }
+			let interrupter = ActionDisposable(action: observer.sendInterrupted)
+
+			return (signal, start, interrupter)
+		})
+	}
+
+	/// Create a SignalProducer that will invoke the given factory once for each
+	/// invocation of `start()`.
+	///
+	/// - parameters:
+	///   - builder: A builder that is used by `startWithSignal` to create new `Signal`s.
+	fileprivate init(_ builder: Builder) {
+		self.builder = builder
 	}
 
 	/// Creates a producer for a `Signal` that will immediately send one value
@@ -165,23 +197,15 @@ public struct SignalProducer<Value, Error: Swift.Error> {
 	/// - parameters:
 	///   - setUp: A closure that accepts a `signal` and `interrupter`.
 	public func startWithSignal(_ setup: (_ signal: Signal<Value, Error>, _ interrupter: Disposable) -> Void) {
-		// Disposes of the work associated with the SignalProducer and any
-		// upstream producers.
-		let producerDisposable = CompositeDisposable()
+		let (source, start, interrupter) = builder.make()
 
-		let (signal, observer) = Signal<Value, Error>.pipe(disposable: producerDisposable)
+		setup(source, interrupter)
 
-		// Directly disposed of when `start()` or `startWithSignal()` is
-		// disposed.
-		let cancelDisposable = ActionDisposable(action: observer.sendInterrupted)
-
-		setup(signal, cancelDisposable)
-
-		if cancelDisposable.isDisposed {
+		if interrupter.isDisposed {
 			return
 		}
 
-		startHandler(observer, producerDisposable)
+		start()
 	}
 }
 
@@ -352,15 +376,59 @@ extension SignalProducer {
 	/// - returns: A signal producer that applies signal's operator to every
 	///            created signal.
 	public func lift<U, F>(_ transform: @escaping (Signal<Value, Error>) -> Signal<U, F>) -> SignalProducer<U, F> {
-		return SignalProducer<U, F> { observer, outerDisposable in
-			self.startWithSignal { signal, innerDisposable in
-				outerDisposable += innerDisposable
+		return SignalProducer<U, F>(.init {
+			let (signal, start, interrupter) = self.producer.builder.make()
+			return (transform(signal), start, interrupter)
+		})
+	}
 
-				transform(signal).observe(observer)
-			}
+	/// Lift a binary Signal operator to operate upon SignalProducers.
+	///
+	/// The left producer would first be started. When both producers are synchronous this
+	/// order can be important depending on the operator to generate correct results.
+	///
+	/// - returns: A factory that creates a SignalProducer with the given operator
+	///            applied. `self` would be the LHS, and the factory input would
+	///            be the RHS.
+	fileprivate func liftLeft<U, F, V, G>(_ transform: @escaping (Signal<Value, Error>) -> (Signal<U, F>) -> Signal<V, G>) -> (SignalProducer<U, F>) -> SignalProducer<V, G> {
+		return lift(leftFirst: true, transform)
+	}
+
+	/// Lift a binary Signal operator to operate upon SignalProducers.
+	///
+	/// The right producer would first be started. When both producers are synchronous
+	/// this order can be important depending on the operator to generate correct results.
+	///
+	/// - returns: A factory that creates a SignalProducer with the given operator
+	///            applied. `self` would be the LHS, and the factory input would
+	///            be the RHS.
+	fileprivate func liftRight<U, F, V, G>(_ transform: @escaping (Signal<Value, Error>) -> (Signal<U, F>) -> Signal<V, G>) -> (SignalProducer<U, F>) -> SignalProducer<V, G> {
+		return lift(leftFirst: false, transform)
+	}
+
+	private func lift<U, F, V, G>(leftFirst: Bool, _ transform: @escaping (Signal<Value, Error>) -> (Signal<U, F>) -> Signal<V, G>) -> (SignalProducer<U, F>) -> SignalProducer<V, G> {
+		return { otherProducer in
+			return SignalProducer<V, G>(.init {
+				let (leftSignal, leftStart, leftInterrupter) = self.producer.builder.make()
+				let (rightSignal, rightStart, rightInterrupter) = otherProducer.builder.make()
+
+				let start = {
+					if leftFirst {
+						leftStart()
+						rightStart()
+					} else {
+						rightStart()
+						leftStart()
+					}
+				}
+
+				return (transform(leftSignal)(rightSignal), start, ActionDisposable {
+					leftInterrupter.dispose()
+					rightInterrupter.dispose()
+				})
+			})
 		}
 	}
-	
 
 	/// Lift a binary Signal operator to operate upon SignalProducers instead.
 	///
@@ -378,46 +446,6 @@ extension SignalProducer {
 	/// - returns: A binary operator that operates on two signal producers.
 	public func lift<U, F, V, G>(_ transform: @escaping (Signal<Value, Error>) -> (Signal<U, F>) -> Signal<V, G>) -> (SignalProducer<U, F>) -> SignalProducer<V, G> {
 		return liftRight(transform)
-	}
-
-	/// Right-associative lifting of a binary signal operator over producers.
-	/// That is, the argument producer will be started before the receiver. When
-	/// both producers are synchronous this order can be important depending on
-	/// the operator to generate correct results.
-	private func liftRight<U, F, V, G>(_ transform: @escaping (Signal<Value, Error>) -> (Signal<U, F>) -> Signal<V, G>) -> (SignalProducer<U, F>) -> SignalProducer<V, G> {
-		return { otherProducer in
-			return SignalProducer<V, G> { observer, outerDisposable in
-				self.startWithSignal { signal, disposable in
-					outerDisposable.add(disposable)
-
-					otherProducer.startWithSignal { otherSignal, otherDisposable in
-						outerDisposable += otherDisposable
-
-						transform(signal)(otherSignal).observe(observer)
-					}
-				}
-			}
-		}
-	}
-
-	/// Left-associative lifting of a binary signal operator over producers.
-	/// That is, the receiver will be started before the argument producer. When
-	/// both producers are synchronous this order can be important depending on
-	/// the operator to generate correct results.
-	fileprivate func liftLeft<U, F, V, G>(_ transform: @escaping (Signal<Value, Error>) -> (Signal<U, F>) -> Signal<V, G>) -> (SignalProducer<U, F>) -> SignalProducer<V, G> {
-		return { otherProducer in
-			return SignalProducer<V, G> { observer, outerDisposable in
-				otherProducer.startWithSignal { otherSignal, otherDisposable in
-					outerDisposable += otherDisposable
-					
-					self.startWithSignal { signal, disposable in
-						outerDisposable.add(disposable)
-
-						transform(signal)(otherSignal).observe(observer)
-					}
-				}
-			}
-		}
 	}
 
 	/// Lift a binary Signal operator to operate upon a Signal and a
@@ -1437,25 +1465,18 @@ extension SignalProducer {
 		disposed: (() -> Void)? = nil,
 		value: ((Value) -> Void)? = nil
 	) -> SignalProducer<Value, Error> {
-		return SignalProducer { observer, compositeDisposable in
-			starting?()
-			defer { started?() }
-
-			self.startWithSignal { signal, disposable in
-				compositeDisposable += disposable
-				signal
-					.on(
-						event: event,
-						failed: failed,
-						completed: completed,
-						interrupted: interrupted,
-						terminated: terminated,
-						disposed: disposed,
-						value: value
-					)
-					.observe(observer)
-			}
-		}
+		return SignalProducer<Value, Error>(Builder {
+			let (signal, start, interrupter) = self.producer.builder.make()
+			return (signal.on(event: event,
+			                  failed: failed,
+			                  completed: completed,
+			                  interrupted: interrupted,
+			                  terminated: terminated,
+			                  disposed: disposed,
+			                  value: value),
+			        { starting?(); start(); started?() },
+			        interrupter)
+		})
 	}
 
 	/// Start the returned producer on the given `Scheduler`.
