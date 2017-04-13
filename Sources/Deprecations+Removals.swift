@@ -1,7 +1,14 @@
 import Foundation
+import Dispatch
 import enum Result.NoError
 
 // MARK: Obsolete types in ReactiveSwift 2.0.
+@available(*, unavailable, renamed:"DateScheduler.timer(interval:self:)")
+public func timer(interval: DispatchTimeInterval, on scheduler: DateScheduler) -> SignalProducer<Date, NoError> { fatalError() }
+
+@available(*, unavailable, renamed:"DateScheduler.timer(interval:self:leeway:)")
+public func timer(interval: DispatchTimeInterval, on scheduler: DateScheduler, leeway: DispatchTimeInterval) -> SignalProducer<Date, NoError> { fatalError() }
+
 @available(*, unavailable, message: "This protocol has been removed. Constrain `Action` directly instead.")
 public protocol ActionProtocol {}
 

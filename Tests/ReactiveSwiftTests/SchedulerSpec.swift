@@ -8,11 +8,10 @@
 
 import Dispatch
 import Foundation
-
 import Nimble
 import Quick
-@testable
-import ReactiveSwift
+import enum Result.NoError
+@testable import ReactiveSwift
 
 #if os(Linux)
 	import func CoreFoundation._CFIsMainThread
@@ -305,6 +304,72 @@ class SchedulerSpec: QuickSpec {
 				scheduler.run()
 				expect(scheduler.currentDate) == NSDate.distantFuture
 				expect(string) == "fuzzbuzzfoobar"
+			}
+		}
+
+		describe("DateScheduler.timer") {
+			it("should send the current date at the given interval") {
+				let scheduler = TestScheduler()
+				let producer = scheduler.timer(interval: .seconds(1), leeway: .seconds(0))
+
+				let startDate = scheduler.currentDate
+				let tick1 = startDate.addingTimeInterval(1)
+				let tick2 = startDate.addingTimeInterval(2)
+				let tick3 = startDate.addingTimeInterval(3)
+
+				var dates: [Date] = []
+				producer.startWithValues { dates.append($0) }
+
+				scheduler.advance(by: .milliseconds(900))
+				expect(dates) == []
+
+				scheduler.advance(by: .seconds(1))
+				expect(dates) == [tick1]
+
+				scheduler.advance()
+				expect(dates) == [tick1]
+
+				scheduler.advance(by: .milliseconds(200))
+				expect(dates) == [tick1, tick2]
+
+				scheduler.advance(by: .seconds(1))
+				expect(dates) == [tick1, tick2, tick3]
+			}
+
+			it("shouldn't overflow on a real scheduler") {
+				let scheduler: QueueScheduler
+				if #available(OSX 10.10, *) {
+					scheduler = QueueScheduler(qos: .default, name: "\(#file):\(#line)")
+				} else {
+					scheduler = QueueScheduler(queue: DispatchQueue(label: "\(#file):\(#line)"))
+				}
+
+				let producer = scheduler.timer(interval: .seconds(3))
+				producer
+					.start()
+					.dispose()
+			}
+
+			it("should release the signal when disposed") {
+				let scheduler = TestScheduler()
+				let producer = scheduler.timer(interval: .seconds(1), leeway: .seconds(0))
+				var interrupted = false
+
+				weak var weakSignal: Signal<Date, NoError>?
+				producer.startWithSignal { signal, disposable in
+					weakSignal = signal
+					scheduler.schedule {
+						disposable.dispose()
+					}
+					signal.observeInterrupted { interrupted = true }
+				}
+
+				expect(weakSignal).toNot(beNil())
+				expect(interrupted) == false
+
+				scheduler.run()
+				expect(weakSignal).to(beNil())
+				expect(interrupted) == true
 			}
 		}
 	}

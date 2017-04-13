@@ -8,6 +8,7 @@
 
 import Dispatch
 import Foundation
+import enum Result.NoError
 
 #if os(Linux)
 	import let CDispatch.NSEC_PER_SEC
@@ -65,6 +66,60 @@ public protocol DateScheduler: Scheduler {
 	///            before it begins.
 	@discardableResult
 	func schedule(after date: Date, interval: DispatchTimeInterval, leeway: DispatchTimeInterval, action: @escaping () -> Void) -> Disposable?
+}
+
+extension DateScheduler {
+	/// Create a repeating timer of the given interval, with a reasonable default
+	/// leeway, sending updates on the given scheduler.
+	///
+	/// - note: This timer will never complete naturally, so all invocations of
+	///         `start()` must be disposed to avoid leaks.
+	///
+	/// - precondition: `interval` must be non-negative number.
+	///
+	///	- note: If you plan to specify an `interval` value greater than 200,000
+	///			seconds, use `timer(interval:on:leeway:)` instead
+	///			and specify your own `leeway` value to avoid potential overflow.
+	///
+	/// - parameters:
+	///   - interval: An interval between invocations.
+	///   - scheduler: A scheduler to deliver events on.
+	///
+	/// - returns: A producer that sends `NSDate` values every `interval` seconds.
+	public func timer(interval: DispatchTimeInterval) -> SignalProducer<Date, NoError> {
+		// Apple's "Power Efficiency Guide for Mac Apps" recommends a leeway of
+		// at least 10% of the timer interval.
+		return timer(interval: interval, leeway: interval * 0.1)
+	}
+
+	/// Creates a repeating timer of the given interval, sending updates on the
+	/// given scheduler.
+	///
+	/// - note: This timer will never complete naturally, so all invocations of
+	///         `start()` must be disposed to avoid leaks.
+	///
+	/// - precondition: `interval` must be non-negative number.
+	///
+	/// - precondition: `leeway` must be non-negative number.
+	///
+	/// - parameters:
+	///   - interval: An interval between invocations.
+	///   - scheduler: A scheduler to deliver events on.
+	///   - leeway: Interval leeway. Apple's "Power Efficiency Guide for Mac Apps"
+	///             recommends a leeway of at least 10% of the timer interval.
+	///
+	/// - returns: A producer that sends `NSDate` values every `interval` seconds.
+	public func timer(interval: DispatchTimeInterval, leeway: DispatchTimeInterval) -> SignalProducer<Date, NoError> {
+		precondition(interval.timeInterval >= 0)
+		precondition(leeway.timeInterval >= 0)
+
+		return SignalProducer { observer, compositeDisposable in
+			compositeDisposable += self.schedule(after: self.currentDate.addingTimeInterval(interval),
+			                                     interval: interval,
+			                                     leeway: leeway,
+			                                     action: { observer.send(value: self.currentDate) })
+		}
+	}
 }
 
 /// A scheduler that performs all work synchronously.
